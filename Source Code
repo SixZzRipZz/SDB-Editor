@@ -1,0 +1,1018 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, simpledialog, messagebox
+import os
+import struct
+import threading
+import pickle
+import pandas as pd
+import logging
+import ttkbootstrap as ttkb
+from ttkbootstrap.constants import *
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class SDBEditor(ttkb.Window):
+    def __init__(self):
+        super().__init__(title="SDB Editor v1.8", themename="darkly", size=(1600, 1200))
+
+        # Set the taskbar icon
+        self.iconbitmap('generic_icon.ico')
+
+        # Ensure subdirectories exist
+        os.makedirs('rollback', exist_ok=True)
+        os.makedirs('metadata', exist_ok=True)
+
+        # Add metadata display and theme selection at the top
+        top_frame = ttkb.Frame(self)
+        top_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        # Metadata display
+        ttkb.Label(top_frame, text="").pack(side=tk.LEFT, padx=5)
+        self.metadata_label = ttkb.Label(top_frame, text="No file loaded")
+        self.metadata_label.pack(side=tk.LEFT, padx=5)
+        self.update_metadata_button = ttkb.Button(top_frame, text="Update Metadata", command=self.update_metadata, bootstyle="outline-toolbutton")
+        self.update_metadata_button.pack(side=tk.LEFT, padx=5)
+        self.update_metadata_button.pack_forget()  # Initially hide the button
+
+        # Theme selection
+        ttkb.Label(top_frame, text="").pack(side=tk.RIGHT, padx=5)
+        self.theme_var = tk.StringVar(value="darkly")
+        self.theme_dropdown = ttkb.Combobox(top_frame, textvariable=self.theme_var, values=ttkb.Style().theme_names(), state='readonly')
+        self.theme_dropdown.pack(side=tk.RIGHT, padx=5)
+        self.theme_dropdown.bind("<<ComboboxSelected>>", self.change_theme)
+
+        # Unmangle save option
+        self.unmangle_save_var = tk.BooleanVar(value=True)  # Always save as unmangled
+        self.unmangle_save_checkbox = ttkb.Checkbutton(top_frame, text="Save as Unmangled", variable=self.unmangle_save_var)
+        self.unmangle_save_checkbox.pack(side=tk.RIGHT, padx=5)
+        self.unmangle_save_checkbox.pack_forget()  # Hide the checkbox as it's always true
+
+        # Create menu
+        menubar = tk.Menu(self)
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Open", command=self.open_file)
+        file_menu.add_command(label="Save As SDB", command=self.save_as_file)
+        file_menu.add_command(label="Import Strings", command=self.import_strings)
+        file_menu.add_command(label="Export Strings", command=self.export_strings)  # Added Export Strings option
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        edit_menu = tk.Menu(menubar, tearoff=0)
+        edit_menu.add_command(label="Add New String", command=self.add_new_string)
+        edit_menu.add_command(label="Add Multiple Strings", command=self.add_multiple_strings)
+        menubar.add_cascade(label="Edit", menu=edit_menu)
+
+        fixes_menu = tk.Menu(menubar, tearoff=0)
+        fixes_menu.add_command(label="Fix Corrupted Database", command=self.fix_corrupted_database)
+        fixes_menu.add_command(label="Rollback", command=self.rollback)
+        fixes_menu.add_command(label="Show Duplicate Entries", command=self.show_duplicate_entries)  # Added Show Duplicate Entries option
+        menubar.add_cascade(label="Fixes", menu=fixes_menu)
+
+        self.config(menu=menubar)
+
+        # Create Treeview frame
+        tree_frame = ttkb.Frame(self)
+        tree_frame.pack(fill=tk.BOTH, expand=1)
+
+        # Create Treeview Scrollbar
+        tree_scroll = ttkb.Scrollbar(tree_frame)
+        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Create Treeview
+        self.tree = ttkb.Treeview(tree_frame, columns=("Index", "String Hash ID", "Hex", "Text", "Mangled"), show='headings', yscrollcommand=tree_scroll.set)
+        self.tree.heading("Index", text="Index")
+        self.tree.heading("String Hash ID", text="String Hash ID")
+        self.tree.heading("Hex", text="Hex")
+        self.tree.heading("Text", text="Text")
+        self.tree.heading("Mangled", text="Mangled")
+        self.tree.column("Index", width=50)
+        self.tree.column("String Hash ID", width=100)
+        self.tree.column("Hex", width=100)
+        self.tree.column("Text", width=800)
+        self.tree.column("Mangled", width=100)
+
+        self.tree.pack(expand=1, fill=tk.BOTH)
+
+        tree_scroll.config(command=self.tree.yview)
+        self.tree.bind("<Enter>", lambda e: self.bind_all("<MouseWheel>", lambda event: self.tree.yview_scroll(int(-1*(event.delta/120)), "units")))
+        self.tree.bind("<Leave>", lambda e: self.unbind_all("<MouseWheel>"))
+
+        # Bind double-click event to edit the text
+        self.tree.bind("<Double-1>", self.on_double_click)
+        # Bind right-click event to open context menu
+        self.tree.bind("<Button-3>", self.show_context_menu)
+
+        # Search and edit frame
+        self.search_frame = ttkb.Frame(self)
+        self.search_frame.pack(fill=tk.X)
+
+        ttkb.Label(self.search_frame, text="Search:").pack(side=tk.LEFT, padx=5)
+        self.search_entry = ttkb.Entry(self.search_frame)
+        self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=1, padx=5)
+        self.search_entry.bind("<KeyRelease>", self.update_search)
+
+        ttkb.Label(self.search_frame, text="Search by:").pack(side=tk.LEFT, padx=5)
+        self.search_by = tk.StringVar(value="Text")
+        self.search_by_dropdown = ttkb.Combobox(self.search_frame, textvariable=self.search_by, values=["Index", "String Hash ID", "Text"], state='readonly')
+        self.search_by_dropdown.pack(side=tk.LEFT, padx=5)
+
+        # Progress bar frame
+        self.progress_frame = ttkb.Frame(self)
+        self.progress_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.progress_label = ttkb.Label(self.progress_frame, text="")
+        self.progress_label.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+
+        # Add buttons
+        self.unmangle_button = ttkb.Button(self.progress_frame, text="Unmangle", command=self.unmangle_current_sdb, bootstyle="outline-toolbutton")
+        self.unmangle_button.pack(side=tk.RIGHT, padx=5)
+
+        self.change_language_button = ttkb.Button(self.progress_frame, text="Change Language", command=self.change_language, bootstyle="outline-toolbutton")
+        self.change_language_button.pack(side=tk.RIGHT, padx=5)
+
+        self.merge_dlc_button = ttkb.Button(self.progress_frame, text="Merge SDBs", command=self.merge_dlc, bootstyle="outline-toolbutton")
+        self.merge_dlc_button.pack(side=tk.RIGHT, padx=5)
+
+        self.save_sdb_button = ttkb.Button(self.progress_frame, text="Save SDB", command=self.save_as_file, bootstyle="outline-toolbutton")
+        self.save_sdb_button.pack(side=tk.RIGHT, padx=5)
+
+        # Initialize data storage
+        self.current_file = None
+        self.original_data = []  # Cache for original data
+        self.filtered_data = []  # Cache for filtered data
+        self.is_mangled = False
+        self.game_name = "Unknown Game"
+        self.metadata = {}
+        self.special_characters = set()
+        self.library = {}  # Initialize the library
+
+        # Initialize backup storage
+        self.backup_states = self.load_backup_states()
+
+        # Create context menu
+        self.context_menu = tk.Menu(self, tearoff=0, bg='#333333', fg='#ffffff')
+        self.context_menu.add_command(label="Edit", command=self.edit_selected_item)
+        self.context_menu.add_command(label="Delete", command=self.delete_selected_item)  # Added Delete option
+        self.context_menu.add_command(label="Copy Index", command=self.copy_selected_index)
+        self.context_menu.add_command(label="Copy Hash ID", command=self.copy_selected_hash_id)
+        self.context_menu.add_command(label="Copy Hex", command=self.copy_selected_hash_id_hex)  # Added Copy Hex option
+
+        self.context_menu.add_separator()
+        self.special_characters_menu = tk.Menu(self.context_menu, tearoff=0, bg='#333333', fg='#ffffff')
+        self.context_menu.add_cascade(label="Insert Special Character", menu=self.special_characters_menu)
+
+    def change_theme(self, event=None):
+        selected_theme = self.theme_var.get()
+        self.style.theme_use(selected_theme)
+
+    def open_file(self):
+        file_path = filedialog.askopenfilename(filetypes=[("SDB files", "*.sdb")])
+        if file_path:
+            self.current_file = file_path
+            self.load_sdb(file_path)
+
+    def load_sdb(self, file_path):
+        logging.info(f"Loading file: {file_path}")
+        self.is_mangled = is_mangled(file_path)
+        logging.info(f"Is mangled: {self.is_mangled}")
+        strings = self.decrypt_sdb(file_path) if self.is_mangled else self.read_sdb(file_path)
+        self.original_data = [(hash_id, text, self.is_mangled) for hash_id, text in strings]
+        self.filtered_data = self.original_data.copy()
+        self.display_strings(self.filtered_data)
+        self.detect_special_characters()
+        self.update_special_characters_menu()
+        # Update metadata display
+        game_name, language = self.get_game_name_and_language(file_path)
+        self.game_name = game_name  # Store the game name
+        self.metadata = self.load_metadata(file_path)  # Load the metadata
+        self.metadata_label.config(text=f"Game: {game_name}, Language: {language}, Mangled: {self.is_mangled}")
+        if game_name == "Unknown Game":
+            self.update_metadata_button.pack(side=tk.LEFT, padx=5)
+        else:
+            self.update_metadata_button.pack_forget()
+
+    def update_metadata(self):
+        game_name, language = self.get_game_name_and_language(self.current_file, prompt=True)
+        self.metadata_label.config(text=f"Game: {game_name}, Language: {language}, Mangled: {self.is_mangled}")
+        self.update_metadata_button.pack_forget()
+
+    def get_game_name_and_language(self, file_path, prompt=False):
+        game_name = "Unknown Game"
+        language = "Unknown Language"
+        metadata_path = 'metadata'
+
+        for game_folder in os.listdir(metadata_path):
+            game_folder_path = os.path.join(metadata_path, game_folder)
+            if os.path.isdir(game_folder_path):
+                for language_file in os.listdir(game_folder_path):
+                    language_file_path = os.path.join(game_folder_path, language_file)
+                    if os.path.isfile(language_file_path) and language_file_path.endswith('.sdb'):
+                        if self.compare_sdb_files(file_path, language_file_path):
+                            game_name = game_folder
+                            language = os.path.splitext(language_file)[0]
+                            break
+
+        if prompt:
+            game_name = simpledialog.askstring("Game Name", "Enter the game name:", initialvalue=game_name, parent=self)
+            language = simpledialog.askstring("Language", "Enter the language:", initialvalue=language, parent=self)
+
+            # Create necessary directories if they don't exist
+            os.makedirs(os.path.join(metadata_path, game_name), exist_ok=True)
+            metadata_path = os.path.join(metadata_path, game_name)
+            self.save_metadata()  # Save metadata immediately after creation
+
+        return game_name, language
+
+    def compare_sdb_files(self, file1, file2):
+        with open(file1, 'rb') as f1, open(file2, 'rb') as f2:
+            return f1.read() == f2.read()
+
+    def load_metadata(self, file_path):
+        metadata_path = os.path.join('metadata', self.game_name, 'metadata.pkl')
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'rb') as file:
+                return pickle.load(file)
+        else:
+            return {}
+
+    def save_metadata(self):
+        metadata_path = os.path.join('metadata', self.game_name, 'metadata.pkl')
+        os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+        with open(metadata_path, 'wb') as file:
+            pickle.dump(self.metadata, file)
+
+    def display_strings(self, strings):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        for i, (hash_id, string, mangled) in enumerate(strings):
+            decoded_string = string.decode('utf-8', errors='replace')
+            self.tree.insert("", "end", values=(i, hash_id, format(hash_id, 'X'), decoded_string, mangled))
+        logging.info("Displayed strings")
+
+    def update_search(self, event):
+        self.search_text()
+
+    def search_text(self):
+        search_query = self.search_entry.get()
+        search_by = self.search_by.get()
+
+        self.filtered_data = []
+
+        for i, (hash_id, text, mangled) in enumerate(self.original_data):
+            if search_by == "Index":
+                data_to_check = str(i)
+            elif search_by == "String Hash ID":
+                data_to_check = str(hash_id)
+            else:
+                data_to_check = text.decode('utf-8', errors='replace')
+
+            search_query = search_query.lower()
+            data_to_check = data_to_check.lower()
+
+            if search_query in data_to_check:
+                self.filtered_data.append((hash_id, text, mangled))
+
+        self.display_strings(self.filtered_data)
+
+    def save_file(self):
+        self.create_backup()
+        if self.current_file:
+            self.progress_label.config(text="Processing...")
+            thread = threading.Thread(target=self.save_sdb, args=(self.current_file,))
+            thread.start()
+
+    def save_as_file(self):
+        self.create_backup()
+        file_path = filedialog.asksaveasfilename(defaultextension=".sdb", filetypes=[("SDB files", "*.sdb")])
+        if file_path:
+            self.progress_label.config(text="Processing...")
+            thread = threading.Thread(target=self.save_sdb, args=(file_path,))
+            thread.start()
+
+    def decrypt_sdb(self, file_path):
+        with open(file_path, 'rb') as file:
+            header_tag = struct.unpack('I', file.read(4))[0]
+            num_strings = struct.unpack('I', file.read(4))[0]
+
+            entries = []
+            for _ in range(num_strings):
+                address = struct.unpack('I', file.read(4))[0]
+                size = struct.unpack('I', file.read(4))[0]
+                guid = struct.unpack('I', file.read(4))[0]
+                entries.append((address, size, guid))
+
+            decrypted_strings = []
+            for address, size, guid in entries:
+                file.seek(address)
+                encrypted_string = file.read(size)
+                decrypted_string = demangle_string(encrypted_string, address)
+                decrypted_strings.append((guid, decrypted_string))
+        logging.info("Decrypted strings")
+        return decrypted_strings
+
+    def read_sdb(self, file_path):
+        with open(file_path, 'rb') as file:
+            header_tag = struct.unpack('I', file.read(4))[0]
+            num_strings = struct.unpack('I', file.read(4))[0]
+
+            entries = []
+            for _ in range(num_strings):
+                address = struct.unpack('I', file.read(4))[0]
+                size = struct.unpack('I', file.read(4))[0]
+                guid = struct.unpack('I', file.read(4))[0]
+                entries.append((address, size, guid))
+
+            strings = []
+            for address, size, guid in entries:
+                file.seek(address)
+                string = file.read(size)
+                strings.append((guid, string))
+        logging.info("Read strings")
+        return strings
+
+    def save_sdb(self, file_path):
+        strings = self.original_data
+        logging.info(f"Saving to {file_path}")
+
+        try:
+            with open(file_path, 'wb') as file:
+                save_as_unmangled = self.unmangle_save_var.get()
+                header_tag = 0x0 if save_as_unmangled else 0x100 if any(was_mangled for _, _, was_mangled in strings) else 0x0
+                file.write(struct.pack('I', header_tag))
+                num_strings = len(strings)
+                file.write(struct.pack('I', num_strings))
+
+                table_ptr = 8 + (12 * num_strings)
+                string_data = bytearray()
+                address_data = bytearray()
+
+                for hash_id, string, _ in strings:
+                    address_data.extend(struct.pack('I', table_ptr))
+                    address_data.extend(struct.pack('I', len(string)))
+                    address_data.extend(struct.pack('I', hash_id))
+                    string_data.extend(string)
+                    string_data.append(0)  # Add null terminator
+                    table_ptr += len(string) + 1
+
+                file.write(address_data)
+                file.write(string_data)
+
+                logging.info(f"Saved {num_strings} strings to {file_path}")
+                self.progress_label.config(text="Save completed")
+
+        except Exception as e:
+            logging.error(f"Error saving SDB file: {e}")
+            messagebox.showerror("Save Error", f"An error occurred while saving the SDB file: {e}")
+
+    def unmangle_current_sdb(self):
+        if self.is_mangled:
+            new_data = []
+            for hash_id, text, mangled in self.original_data:
+                if mangled:
+                    decrypted_text = demangle_string(text, hash_id)
+                    new_data.append((hash_id, decrypted_text, False))
+                else:
+                    new_data.append((hash_id, text, False))
+            self.original_data = new_data
+            self.filtered_data = self.original_data.copy()
+            self.display_strings(self.filtered_data)
+            self.is_mangled = False
+            messagebox.showinfo("Unmangle", "SDB file unmangled successfully.")
+
+    def change_language(self):
+        metadata_path = os.path.join('metadata', self.metadata_label.cget("text").split(",")[0].split(":")[1].strip())
+        if not os.path.isdir(metadata_path):
+            messagebox.showinfo("No Languages", "No languages available in the metadata folder. Please add a language file.")
+            return
+
+        languages = [os.path.splitext(f)[0] for f in os.listdir(metadata_path) if f.endswith('.sdb')]
+        language_selection = LanguageSelectionDialog(self, languages).result
+        if language_selection:
+            language_name = language_selection
+            language_file_path = os.path.join(metadata_path, f"{language_name}.sdb")
+            if os.path.isfile(language_file_path):
+                self.apply_language(language_file_path)
+
+    def apply_language(self, language_file_path):
+        strings = self.decrypt_sdb(language_file_path) if is_mangled(language_file_path) else self.read_sdb(language_file_path)
+        language_data = {hash_id: text for hash_id, text in strings}
+
+        new_data = []
+        for hash_id, text, mangled in self.original_data:
+            if hash_id in language_data:
+                new_text = language_data[hash_id]
+                new_data.append((hash_id, new_text, mangled))
+            else:
+                new_data.append((hash_id, text, mangled))
+
+        self.original_data = new_data
+        self.filtered_data = self.original_data.copy()
+        self.display_strings(self.filtered_data)
+        messagebox.showinfo("Language Change", f"Language changed successfully to the language in {os.path.basename(language_file_path)}.")
+
+    def merge_dlc(self):
+        dlc_file_path = filedialog.askopenfilename(title="Select the DLC SDB file", filetypes=[("SDB files", "*.sdb")])
+        if dlc_file_path:
+            dlc_data = self.decrypt_sdb(dlc_file_path) if is_mangled(dlc_file_path) else self.read_sdb(dlc_file_path)
+            existing_hash_map = {hash_id: text for hash_id, text, _ in self.original_data}
+
+            for hash_id, text in dlc_data:
+                if hash_id not in existing_hash_map:
+                    self.original_data.append((hash_id, text, False))
+
+            last_hash_id = self.get_last_hash_id()
+            for hash_id, text in dlc_data:
+                if hash_id in existing_hash_map and existing_hash_map[hash_id] != text:
+                    new_hash_id = self.generate_unique_hash_id(last_hash_id)
+                    last_hash_id = new_hash_id
+                    self.original_data.append((new_hash_id, text, False))
+
+            self.filtered_data = self.original_data.copy()
+            self.display_strings(self.filtered_data)
+            messagebox.showinfo("DLC Merge", "DLC strings merged successfully.")
+
+    def fix_corrupted_database(self):
+        if self.metadata:
+            restored_data = []
+            for hash_id, data in self.metadata.items():
+                for original_hash_id, original_text, _ in self.original_data:
+                    if original_hash_id == hash_id:
+                        restored_data.append((original_hash_id, data['text'], self.is_mangled))
+            self.original_data = restored_data
+            self.filtered_data = self.original_data.copy()
+            self.display_strings(self.filtered_data)
+            messagebox.showinfo("Fix Corrupted Database", "Database has been fixed using the metadata.")
+        else:
+            messagebox.showinfo("Fix Corrupted Database", "No metadata available to fix the database.")
+
+    def show_duplicate_entries(self):
+        duplicate_entries = []
+        seen_hash_ids = set()
+
+        for i, (hash_id, text, mangled) in enumerate(self.original_data):
+            if hash_id in seen_hash_ids:
+                duplicate_entries.append((hash_id, text, mangled))
+            else:
+                seen_hash_ids.add(hash_id)
+
+        self.filtered_data = duplicate_entries
+        self.display_strings(self.filtered_data)
+        messagebox.showinfo("Duplicate Entries", f"Found {len(duplicate_entries)} duplicate entries.")
+
+    def rollback(self):
+        if not self.backup_states:
+            messagebox.showinfo("Rollback", "No backups available to rollback.")
+            return
+
+        backup_files = [(index, os.path.basename(file_path)) for index, file_path in enumerate(self.backup_states)]
+        selected_backup = simpledialog.askinteger("Rollback", f"Select backup (0 to {len(backup_files) - 1}):\n" + "\n".join([f"{index}: {name}" for index, name in backup_files]))
+        
+        if selected_backup is not None and 0 <= selected_backup < len(self.backup_states):
+            backup_file_path = self.backup_states[selected_backup]
+            self.load_backup(backup_file_path)
+            messagebox.showinfo("Rollback", "Rollback completed successfully.")
+
+    def create_backup(self):
+        if not self.current_file:
+            return
+        
+        backup_file_path = os.path.join('rollback', f"{os.path.basename(self.current_file)}.backup.{len(self.backup_states)}.pkl")
+        with open(backup_file_path, 'wb') as backup_file:
+            pickle.dump(self.original_data, backup_file)
+
+        self.backup_states.append(backup_file_path)
+        if len(self.backup_states) > 5:
+            os.remove(self.backup_states.pop(0))
+
+    def load_backup_states(self):
+        backup_files = sorted([os.path.join('rollback', f) for f in os.listdir('rollback') if f.endswith('.pkl')])
+        return backup_files
+
+    def load_backup(self, file_path):
+        with open(file_path, 'rb') as file:
+            self.original_data = pickle.load(file)
+        self.filtered_data = self.original_data.copy()
+        self.display_strings(self.filtered_data)
+        game_name, language = self.get_game_name_and_language(self.current_file)
+        self.metadata_label.config(text=f"Game: {game_name}, Language: {language}, Mangled: {self.is_mangled}")
+
+    def import_strings(self):
+        file_path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv"), ("Excel files", "*.xlsx"), ("Text files", "*.txt")])
+        if file_path:
+            try:
+                if file_path.endswith(".csv"):
+                    df = pd.read_csv(file_path)
+                elif file_path.endswith(".xlsx"):
+                    df = pd.read_excel(file_path)
+                elif file_path.endswith(".txt"):
+                    df = pd.read_csv(file_path, delimiter=',')
+                else:
+                    messagebox.showerror("Error", "Unsupported file format")
+                    return
+                
+                if 'Text' not in df.columns:
+                    column_name = simpledialog.askstring("Column Name", "Enter the column name for the string text:", parent=self)
+                    if column_name not in df.columns:
+                        messagebox.showerror("Error", "The specified column does not exist in the file")
+                        return
+                else:
+                    column_name = 'Text'
+
+                last_hash_id = self.get_last_hash_id()
+                for i, text in enumerate(df[column_name]):
+                    new_hash_id = self.generate_unique_hash_id(last_hash_id + i)
+                    new_index = len(self.original_data)
+                    self.original_data.append((new_hash_id, text.encode('utf-8'), False))
+                    self.filtered_data.append((new_hash_id, text.encode('utf-8'), False))
+                    self.metadata[new_hash_id] = {'index': new_index, 'text': text.encode('utf-8')}
+                    logging.info(f"Added new string with hash ID {new_hash_id} at index {new_index}")
+
+                self.display_strings(self.filtered_data)
+                self.save_metadata()
+                messagebox.showinfo("Import Strings", "Strings imported successfully.")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to import strings: {e}")
+
+    def export_strings(self):
+        export_path = filedialog.asksaveasfilename(defaultextension="", filetypes=[("CSV files", "*.csv"), ("Excel files", "*.xlsx"), ("Text files", "*.txt")])
+        if export_path:
+            try:
+                df = pd.DataFrame([(i, hash_id, text.decode('utf-8', errors='replace')) for i, (hash_id, text, _) in enumerate(self.original_data)], columns=["Index", "String Hash ID", "Text"])
+                
+                if export_path.endswith(".csv"):
+                    df.to_csv(export_path, index=False)
+                elif export_path.endswith(".xlsx"):
+                    df.to_excel(export_path, index=False)
+                elif export_path.endswith(".txt"):
+                    df.to_csv(export_path, sep=',', index=False)
+                else:
+                    messagebox.showerror("Error", "Unsupported file format")
+                    return
+
+                messagebox.showinfo("Export Strings", f"Strings exported successfully to {export_path}.")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to export strings: {e}")
+
+    def show_context_menu(self, event):
+        selected_item = self.tree.selection()
+        if selected_item:
+            self.context_menu.post(event.x_root, event.y_root)
+
+    def delete_selected_item(self):
+        selected_items = self.tree.selection()
+        if selected_items:
+            for item in selected_items:
+                values = self.tree.item(item, "values")
+                index = int(values[0])
+                hash_id = int(values[1])
+                self.tree.delete(item)
+                self.original_data = [entry for entry in self.original_data if entry[0] != hash_id]
+                self.filtered_data = [entry for entry in self.filtered_data if entry[0] != hash_id]
+            self.display_strings(self.filtered_data)
+            messagebox.showinfo("Delete", f"Deleted {len(selected_items)} item(s) successfully.")
+
+    def copy_selected_index(self):
+        selected_item = self.tree.selection()
+        if selected_item:
+            item = self.tree.item(selected_item)
+            index = item['values'][0]
+            self.clipboard_clear()
+            self.clipboard_append(index)
+            self.update()
+
+    def copy_selected_hash_id(self):
+        selected_item = self.tree.selection()
+        if selected_item:
+            item = self.tree.item(selected_item)
+            hash_id = item['values'][1]
+            self.clipboard_clear()
+            self.clipboard_append(hash_id)
+            self.update()
+
+    def copy_selected_hash_id_hex(self):
+        selected_item = self.tree.selection()
+        if selected_item:
+            item = self.tree.item(selected_item)
+            hash_id_hex = item['values'][2]
+            self.clipboard_clear()
+            self.clipboard_append(hash_id_hex)
+            self.update()
+
+    def on_double_click(self, event):
+        self.edit_selected_item()
+
+    def edit_selected_item(self):
+        selected_items = self.tree.selection()
+        if selected_items:
+            items = [self.tree.item(item) for item in selected_items]
+            indices, hash_ids, hex_ids, texts, mangled = zip(*[item['values'] for item in items])
+            new_texts = BulkEditDialog(self, indices, hash_ids, hex_ids, texts).result
+            if new_texts is not None:
+                for item, new_text in zip(selected_items, new_texts):
+                    index, hash_id, hex_id, _, mangled = self.tree.item(item)['values']
+                    self.tree.item(item, values=(index, hash_id, hex_id, new_text, mangled))
+                    self.update_original_data(index, hash_id, new_text.encode('utf-8'), mangled)
+
+    def update_original_data(self, index, hash_id, new_text, mangled):
+        for i, (h_id, text, m) in enumerate(self.original_data):
+            if h_id == hash_id:
+                self.original_data[i] = (hash_id, new_text, mangled)
+                break
+
+    def add_new_string(self):
+        last_hash_id = self.get_last_hash_id()
+        new_hash_id = self.generate_unique_hash_id(last_hash_id)
+        new_index = len(self.original_data)
+        AddNewStringDialog(self, new_index, new_hash_id)
+
+    def add_multiple_strings(self):
+        AddMultipleStringsDialog(self)
+
+    def get_last_hash_id(self):
+        if not self.original_data:
+            return 0x10000000  # A default starting point if no data is present
+        return max(hash_id for hash_id, _, _ in self.original_data)
+
+    def generate_unique_hash_id(self, last_hash_id):
+        new_hash_id = last_hash_id + 1
+        return new_hash_id
+
+    def detect_special_characters(self):
+        self.special_characters = set()
+        for _, text, _ in self.original_data:
+            decoded_text = text.decode('utf-8', errors='replace')
+            for char in decoded_text:
+                if not char.isascii():
+                    self.special_characters.add(char)
+
+    def update_special_characters_menu(self):
+        self.special_characters_menu.delete(0, tk.END)
+        for char in self.special_characters:
+            self.special_characters_menu.add_command(label=char, command=lambda c=char: self.insert_special_character(c))
+
+    def insert_special_character(self, character):
+        widget = self.focus_get()
+        if isinstance(widget, tk.Text):
+            widget.insert(tk.INSERT, character)
+
+class AddNewStringDialog(simpledialog.Dialog):
+    def __init__(self, parent, index, hash_id):
+        self.parent = parent
+        self.index = index
+        self.hash_id = hash_id
+        self.selected_string = None
+        self.belt_var = tk.BooleanVar()
+        self.arena_var = tk.BooleanVar()
+        self.wrestler_var = tk.BooleanVar()
+        self.social_media_var = tk.BooleanVar()
+        self.string_var = tk.BooleanVar()
+        super().__init__(parent, title="Add New String")
+
+    def body(self, master):
+        info_frame = ttkb.Frame(master)
+        info_frame.pack(side=tk.LEFT, fill=tk.Y, padx=5)
+
+        self.index_label = ttkb.Label(info_frame, text=f"Index: {self.index}")
+        self.index_label.pack(pady=5)
+
+        self.hash_id_label = ttkb.Label(info_frame, text=f"Hash ID: {self.hash_id}")
+        self.hash_id_label.pack(pady=5)
+        ttkb.Button(info_frame, text="Copy Hash ID", command=lambda: self.copy_to_clipboard(self.hash_id), bootstyle=OUTLINE).pack(pady=5)
+
+        self.hex_label = ttkb.Label(info_frame, text=f"Hex: {format(self.hash_id, 'X')}")
+        self.hex_label.pack(pady=5)
+        ttkb.Button(info_frame, text="Copy Hex", command=lambda: self.copy_to_clipboard(format(self.hash_id, 'X')), bootstyle=OUTLINE).pack(pady=5)
+
+        ttkb.Label(master, text="Enter the new string:").pack(pady=5)
+        self.text_area = ttkb.Text(master, wrap=tk.WORD, height=5)  # Adjusted height
+        self.text_area.pack(expand=1, fill=tk.BOTH)
+
+        self.replace_empty_var = tk.BooleanVar()
+        self.replace_empty_checkbutton = ttkb.Checkbutton(master, text="Replace 'empty' in existing strings", variable=self.replace_empty_var, command=self.toggle_replace)
+        self.replace_empty_checkbutton.pack(pady=5)
+
+        self.filter_frame = ttkb.Frame(master)
+        self.empty_strings_listbox = tk.Listbox(master)
+
+        self.filter_frame.pack_forget()
+        self.empty_strings_listbox.pack_forget()
+
+        return self.text_area
+
+    def toggle_replace(self):
+        if self.replace_empty_var.get():
+            self.filter_frame.pack(expand=1, fill=tk.BOTH, padx=5, pady=5)
+            self.empty_strings_listbox.pack(expand=1, fill=tk.BOTH, padx=5, pady=5)
+            self.update_empty_strings_list()
+
+            # Clear any previous filters to prevent duplication
+            for widget in self.filter_frame.winfo_children():
+                widget.destroy()
+
+            ttkb.Label(self.filter_frame, text="Additional filters:").pack(pady=5)
+
+            ttkb.Checkbutton(self.filter_frame, text="Belt", variable=self.belt_var, command=self.update_empty_strings_list).pack(side=tk.LEFT, padx=5)
+            ttkb.Checkbutton(self.filter_frame, text="Arena", variable=self.arena_var, command=self.update_empty_strings_list).pack(side=tk.LEFT, padx=5)
+            ttkb.Checkbutton(self.filter_frame, text="Wrestler", variable=self.wrestler_var, command=self.update_empty_strings_list).pack(side=tk.LEFT, padx=5)
+            ttkb.Checkbutton(self.filter_frame, text="Social Media", variable=self.social_media_var, command=self.update_empty_strings_list).pack(side=tk.LEFT, padx=5)
+            ttkb.Checkbutton(self.filter_frame, text="String", variable=self.string_var, command=self.update_empty_strings_list).pack(side=tk.LEFT, padx=5)
+
+            self.empty_strings_listbox.bind('<<ListboxSelect>>', self.on_select)
+        else:
+            self.filter_frame.pack_forget()
+            self.empty_strings_listbox.pack_forget()
+            self.reset_labels()
+
+    def update_empty_strings_list(self):
+        self.empty_strings_listbox.delete(0, tk.END)
+        filters = [self.belt_var.get(), self.arena_var.get(), self.wrestler_var.get(), self.social_media_var.get(), self.string_var.get()]
+        keywords = ["belt", "arena", "wrestler", "social media", "string"]
+        active_filters = [keyword for keyword, is_active in zip(keywords, filters) if is_active]
+
+        for i, (hash_id, text, mangled) in enumerate(self.parent.original_data):
+            decoded_text = text.decode('utf-8', errors='replace')
+            if 'empty' in decoded_text.lower() and (not active_filters or any(keyword in decoded_text.lower() for keyword in active_filters)):
+                self.empty_strings_listbox.insert(tk.END, f"Index: {i}, Hash ID: {hash_id}, Text: {decoded_text}")
+
+    def on_select(self, event):
+        selection = event.widget.curselection()
+        if selection:
+            index = selection[0]
+            selected_text = event.widget.get(index)
+            parts = selected_text.split(',')
+            self.index = int(parts[0].split(': ')[1])
+            self.hash_id = int(parts[1].split(': ')[1])
+            self.index_label.config(text=f"Index: {self.index}")
+            self.hash_id_label.config(text=f"Hash ID: {self.hash_id}")
+            self.hex_label.config(text=f"Hex: {format(self.hash_id, 'X')}")
+            self.update()
+
+    def reset_labels(self):
+        self.index = len(self.parent.original_data)
+        self.hash_id = self.parent.generate_unique_hash_id(self.parent.get_last_hash_id())
+        self.index_label.config(text=f"Index: {self.index}")
+        self.hash_id_label.config(text=f"Hash ID: {self.hash_id}")
+        self.hex_label.config(text=f"Hex: {format(self.hash_id, 'X')}")
+
+    def apply(self):
+        new_text = self.text_area.get(1.0, tk.END).strip()
+        if new_text:
+            if self.replace_empty_var.get() and self.selected_string:
+                self.parent.original_data[self.index] = (self.hash_id, new_text.encode('utf-8'), False)
+            else:
+                self.parent.original_data.append((self.hash_id, new_text.encode('utf-8'), False))
+                self.parent.filtered_data.append((self.hash_id, new_text.encode('utf-8'), False))
+            # Remove any duplicates by checking and removing duplicates
+            unique_data = list({entry[0]: entry for entry in self.parent.original_data}.values())
+            self.parent.original_data = unique_data
+            self.parent.filtered_data = self.parent.original_data.copy()
+            self.parent.display_strings(self.parent.filtered_data)
+            logging.info(f"Added new string with hash ID {self.hash_id} at index {self.index}")
+
+    def copy_to_clipboard(self, value):
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        self.update()
+
+class BulkEditDialog(simpledialog.Dialog):
+    def __init__(self, parent, indices, hash_ids, hex_ids, texts):
+        self.indices = indices
+        self.hash_ids = hash_ids
+        self.hex_ids = hex_ids
+        self.texts = list(texts)  # Ensure texts are mutable
+        super().__init__(parent, title="String Editing")
+
+    def body(self, master):
+        window_width = 1200
+        window_height = 800
+        self.geometry(f"{window_width}x{window_height}")
+
+        outer_frame = ttkb.Frame(master, padding=10)
+        outer_frame.pack(fill=tk.BOTH, expand=True)
+
+        frame = ttkb.Frame(outer_frame, borderwidth=2, relief="groove")
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        self.entries = []
+        for idx, (index, hash_id, hex_id, text) in enumerate(zip(self.indices, self.hash_ids, self.hex_ids, self.texts)):
+            entry_frame = ttkb.Frame(frame)
+            entry_frame.pack(fill=tk.X, pady=2)
+
+            ttkb.Label(entry_frame, text=f"Index: {index + 1}").pack(side=tk.LEFT, padx=5)
+            ttkb.Button(entry_frame, text="Copy", command=lambda idx=index: self.copy_to_clipboard(idx), bootstyle="outline-toolbutton").pack(side=tk.LEFT, padx=5)
+            ttkb.Label(entry_frame, text=f"Hash ID: {hash_id}").pack(side=tk.LEFT, padx=5)
+            ttkb.Button(entry_frame, text="Copy", command=lambda hid=hash_id: self.copy_to_clipboard(hid), bootstyle="outline-toolbutton").pack(side=tk.LEFT, padx=5)
+            ttkb.Label(entry_frame, text=f"Hex ID: {hex_id}").pack(side=tk.LEFT, padx=5)
+            ttkb.Button(entry_frame, text="Copy", command=lambda hexid=hex_id: self.copy_to_clipboard(hexid), bootstyle="outline-toolbutton").pack(side=tk.LEFT, padx=5)
+
+            entry = ttkb.Entry(entry_frame, width=80)
+            entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+            entry.insert(0, text)
+            self.entries.append(entry)
+
+            entry_frame.columnconfigure(4, weight=1)
+
+        button_frame = ttkb.Frame(outer_frame)
+        button_frame.pack(fill=tk.X, pady=5)
+
+        master.grid_rowconfigure(0, weight=1)
+        master.grid_columnconfigure(0, weight=1)
+
+        self.update_idletasks()
+
+        return self.entries[0] if self.entries else None
+
+    def apply(self):
+        self.result = [entry.get() for entry in self.entries]
+
+    def copy_to_clipboard(self, value):
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        self.update()
+
+class AddMultipleStringsDialog(simpledialog.Dialog):
+    def __init__(self, parent):
+        self.parent = parent
+        self.string_vars = []  # Initialize the string variables cache
+        self.hash_ids = []  # Cache for hash IDs
+        super().__init__(parent, title="Add Multiple Strings")
+
+    def body(self, master):
+        self.geometry("800x600")  # Set initial size
+
+        frame = ttkb.Frame(master)
+        frame.pack(fill=tk.BOTH, expand=1)
+
+        ttkb.Label(frame, text="Number of strings to add:").pack(pady=5)
+        self.num_strings = tk.IntVar(value=1)
+        self.num_strings_dropdown = ttkb.Combobox(frame, textvariable=self.num_strings, values=list(range(1, 51)), state='readonly')
+        self.num_strings_dropdown.pack(pady=5)
+
+        self.string_entries_frame = ttkb.Frame(frame)
+        self.string_entries_frame.pack(fill=tk.BOTH, expand=1)
+
+        self.update_string_entries()
+        self.num_strings_dropdown.bind("<<ComboboxSelected>>", lambda e: self.update_string_entries())
+
+        return self.num_strings_dropdown
+
+    def update_string_entries(self):
+        for widget in self.string_entries_frame.winfo_children():
+            widget.destroy()
+
+        existing_count = len(self.string_vars)
+        new_count = self.num_strings.get()
+
+        last_hash_id = self.parent.get_last_hash_id()
+        for i in range(existing_count, new_count):
+            string_var = tk.StringVar()
+            self.string_vars.append(string_var)
+            self.hash_ids.append(self.parent.generate_unique_hash_id(last_hash_id + i))
+
+        self.string_vars = self.string_vars[:new_count]  # Trim the list if new count is less
+        self.hash_ids = self.hash_ids[:new_count]  # Ensure hash IDs match the number of string vars
+
+        for i, string_var in enumerate(self.string_vars):
+            entry_frame = ttkb.Frame(self.string_entries_frame)
+            entry_frame.pack(fill=tk.X, pady=2)
+
+            index = len(self.parent.original_data) + i
+            hash_id = self.hash_ids[i]
+
+            index_label = ttkb.Label(entry_frame, text=f"Index: {index}")
+            index_label.pack(side=tk.LEFT, padx=5)
+
+            index_copy_button = ttkb.Button(entry_frame, text="Copy", command=lambda idx=index: self.copy_to_clipboard(idx), bootstyle=OUTLINE)
+            index_copy_button.pack(side=tk.LEFT, padx=5)
+
+            hash_id_label = ttkb.Label(entry_frame, text=f"Hash ID: {hash_id}")
+            hash_id_label.pack(side=tk.LEFT, padx=5)
+
+            hash_id_copy_button = ttkb.Button(entry_frame, text="Copy", command=lambda hid=hash_id: self.copy_to_clipboard(hid), bootstyle=OUTLINE)
+            hash_id_copy_button.pack(side=tk.LEFT, padx=5)
+
+            ttkb.Entry(entry_frame, textvariable=string_var, width=100).pack(side=tk.LEFT, fill=tk.X, expand=1, padx=5)
+
+    def copy_to_clipboard(self, value):
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        self.update()
+
+    def apply(self):
+        self.results = [string_var.get() for string_var in self.string_vars if string_var.get()]
+        self.add_strings_to_parent()
+
+    def add_strings_to_parent(self):
+        if self.results:
+            for i, (new_text, string_var, hash_id) in enumerate(zip(self.results, self.string_vars, self.hash_ids)):
+                new_index = len(self.parent.original_data)
+                self.parent.original_data.append((hash_id, new_text.encode('utf-8'), False))
+                self.parent.filtered_data.append((hash_id, new_text.encode('utf-8'), False))
+                self.parent.metadata[hash_id] = {'index': new_index, 'text': new_text.encode('utf-8')}
+                logging.info(f"Added new string with hash ID {hash_id} at index {new_index}")
+            self.parent.display_strings(self.parent.filtered_data)
+            self.parent.save_metadata()
+
+class SyncDialog(simpledialog.Dialog):
+    def __init__(self, parent, secondary_sdb_data, hash_map):
+        self.parent = parent
+        self.secondary_sdb_data = secondary_sdb_data
+        self.hash_map = hash_map
+        super().__init__(parent, title="Sync SDB")
+
+    def body(self, master):
+        self.retained_strings = {}
+        self.replace_all_var = tk.BooleanVar()
+
+        ttkb.Label(master, text="Enter strings to retain original Hash ID for:").pack(pady=5)
+        self.entry_frame = ttkb.Frame(master)
+        self.entry_frame.pack(fill=tk.BOTH, expand=1)
+
+        self.entries = []
+        for _ in range(10):  # Default to 10 entries, user can add more
+            entry = ttkb.Entry(self.entry_frame, width=100)
+            entry.pack(pady=2)
+            entry.bind("<KeyRelease>", self.update_retain_list)
+            self.entries.append(entry)
+
+        self.add_entry_button = ttkb.Button(master, text="Add Entry", command=self.add_entry, bootstyle=OUTLINE)
+        self.add_entry_button.pack(pady=5)
+
+        self.replace_all_checkbutton = ttkb.Checkbutton(master, text="Replace all matching strings", variable=self.replace_all_var)
+        self.replace_all_checkbutton.pack(pady=5)
+
+        return self.entries[0]
+
+    def add_entry(self):
+        entry = ttkb.Entry(self.entry_frame, width=100)
+        entry.pack(pady=2)
+        entry.bind("<KeyRelease>", self.update_retain_list)
+        self.entries.append(entry)
+
+    def update_retain_list(self, event):
+        self.retained_strings = {}
+        for entry in self.entries:
+            text = entry.get()
+            if text:
+                for hash_id, s in self.hash_map.items():
+                    if s.decode('utf-8', errors='replace') == text:
+                        self.retained_strings[hash_id] = s
+                        break
+
+    def apply(self):
+        if self.replace_all_var.get():
+            for hash_id, s in self.hash_map.items():
+                self.parent.original_data.append((hash_id, s, False))
+
+        for hash_id, s in self.retained_strings.items():
+            self.parent.original_data.append((hash_id, s, False))
+
+        self.parent.filtered_data = self.parent.original_data.copy()
+        self.parent.display_strings(self.parent.filtered_data)
+        messagebox.showinfo("Sync SDB", "SDB files synced successfully.")
+
+class LanguageSelectionDialog(simpledialog.Dialog):
+    def __init__(self, parent, languages):
+        self.languages = languages
+        self.result = None
+        super().__init__(parent, title="Select Language")
+
+    def body(self, master):
+        ttkb.Label(master, text="Select or add a language:").pack(pady=5)
+        self.language_var = tk.StringVar(value=self.languages[0])
+        self.language_dropdown = ttkb.Combobox(master, textvariable=self.language_var, values=self.languages + ["Add New Language"], state='readonly')
+        self.language_dropdown.pack(pady=5)
+
+    def apply(self):
+        self.result = self.language_var.get()
+
+def is_mangled(file_path):
+    with open(file_path, 'rb') as file:
+        file.seek(0)
+        header_tag = struct.unpack('I', file.read(4))[0]
+        return header_tag == 0x100
+
+def demangle_string(data, address):
+    key = (address & 0xFF) ^ 0xCD
+    decrypted = bytearray()
+
+    for char in data:
+        decrypted_char = char ^ key
+        decrypted.append(decrypted_char)
+        key = char  # Update key with the original character value
+
+    return decrypted
+
+def mangle_string(data, address):
+    key = (address & 0xFF) ^ 0xCD
+    encrypted = bytearray()
+
+    for char in data:
+        encrypted_char = char ^ key
+        encrypted.append(encrypted_char)
+        key = encrypted_char  # Update key with the encrypted character value
+
+    return encrypted
+
+if __name__ == "__main__":
+    app = SDBEditor()
+    app.mainloop()
